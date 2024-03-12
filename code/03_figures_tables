@@ -1,0 +1,643 @@
+library(tidyverse)
+library(labelled)
+library(scales)
+library(gt)
+library(gtsummary)
+library(flextable)
+library(ftExtra)
+library(survminer)
+library(ggsurvfit)
+library(tidybayes)
+library(cowplot)
+library(officer)
+library(ggpubr)
+library(ggtext)
+
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+save_output <- TRUE
+
+
+# load results
+load("analyses/ARSi-all/derived_data/NM_results.RData")
+# long table sae
+load("analyses/ARSi-all/derived_data/arsiall_sae.RData")
+# after reviewers' comments
+outcome_lab <- "No longer clinically benefitting"
+signatures_legend[["TP53- & AR-"]] <- "*AR* (snv/gsr)-negative and *TP53* wild-type"
+signatures_legend_complement[["TP53- & AR-"]] <- "*AR* (snv/gsr)-positive or *TP53*-altered"
+
+# useful functions -----
+
+# combine ggsurv plots with common legend
+combine_ggsurv <- function(ggsurv_list = NULL, ncol, nrow, byrow = TRUE, rel_heights =  c(3, .2),
+                           ggsurv_list2 = NULL, title2 = NULL) {
+  
+  # no common title
+  if (!is.null(ggsurv_list)) {
+    grobs <- ggplotGrob(ggsurv_list[[1]])$grobs
+    legend <- grobs[[which(sapply(grobs, function(x) x$name) == "guide-box")]]
+    pgrobs <- lapply(ggsurv_list, function(p) {
+      ggsurvfit_build(p + theme(legend.position = "none") +
+                        theme(legend.text = element_markdown(),
+                              plot.title = element_markdown(),
+                              axis.text.y = element_markdown()))
+    })
+    
+    pgrid <- cowplot::plot_grid(plotlist = pgrobs, ncol = ncol, nrow = nrow, byrow = T)
+    pgrid_legend <- cowplot::plot_grid(pgrid, legend, ncol = 1, rel_heights = rel_heights)
+    pgrid_legend
+    
+  } else if (!is.null(ggsurv_list2)) {
+    grobs <- ggplotGrob(ggsurv_list2[[1]][[1]])$grobs
+    legend <- grobs[[which(sapply(grobs, function(x) x$name) == "guide-box")]]
+    
+    if (!is.null(title2)) {
+      ptitle <- lapply(names(ggsurv_list2), function(s) { 
+        #ggdraw() + draw_label(title2[s], fontface = 'bold')
+        # add margin on the left of the drawing canvas, so title is aligned with left edge of first plot
+        #theme(plot.margin = margin(0, 0, 0, 7))
+        ggplot(data = NULL, aes(x = .5, y = .5)) + 
+          geom_richtext(label = title2[s], fontface = 'bold', label.color = NA, size = 5) +
+          theme_void()
+      }) %>% set_names(nm = names(ggsurv_list2))
+      pgrobs_list <- lapply(names(ggsurv_list2), function(s) {
+        plot_grid(
+          ptitle[[s]], plot_grid(plotlist = lapply(ggsurv_list2[[s]], function(o) {
+            ggsurvfit_build(o + theme(legend.position = "none"))
+          }), nrow = 1),
+          ncol = 1, rel_heights = c(0.1, 1)
+        )
+      })
+    } else {
+      pgrobs_list <- lapply(names(ggsurv_list2), function(s) {
+        plot_grid(plotlist = lapply(ggsurv_list2[[s]], function(o) {
+          ggsurvfit_build(o + theme(legend.position = "none",
+                                    legend.text = element_markdown()))
+        }), nrow = 1)
+      })
+    }
+    
+    pgrid <- cowplot::plot_grid(plotlist = pgrobs_list, ncol = ncol, nrow = nrow, byrow = T)
+    pgrid_legend <- cowplot::plot_grid(pgrid, legend, ncol = 1, rel_heights = rel_heights)
+    pgrid_legend
+    
+  }
+  
+}
+
+
+# formatted data and tables ----
+
+# tabular results primary analysis
+tabres_main_cmp <- lapply(type_sensitivity, function(sens) { 
+  lapply(signatures_cr, function(s) {
+    lapply(strsplit(names(cmp_legend), split = "-"), function(cmp) {
+      filter(tabres_main, type_sensitivity == sens, signature == s, therapy_class %in% cmp) %>% 
+        mutate(
+          n_0 = n[therapy_class == cmp[2]],
+          e_0 = progr[therapy_class == cmp[2]],
+          n_1 = n[therapy_class == cmp[1]],
+          e_1 = progr[therapy_class == cmp[1]],
+          comparison = cmp[2]
+        ) %>% 
+        select(type_sensitivity, signature, therapy_class, comparison, n_0, e_0, n_1, e_1) %>% 
+        filter(therapy_class == cmp[1])
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+}) %>% bind_rows()
+
+tabreste_main <- full_join(tesum_main, tabres_main_cmp, 
+                           by = c("type_sensitivity", "signature", "therapy_class", "comparison")) %>% 
+  mutate(
+    signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend),
+    comparison = factor(comparison, levels = names(therapies_legend), labels = therapies_legend),
+    prob_sup_text = format(round(prob_sup, 2), nsmall = 2),
+    STR_text = paste0(format(round(STR_median, 2), nsmall = 2), " (", 
+                      format(round(STR_low, 2), nsmall = 2), ", ",
+                      format(round(STR_high, 2), nsmall = 2), ")"),
+    HR_text = paste0(format(round(HR_median, 2), nsmall = 2), " (", 
+                     format(round(HR_low, 2), nsmall = 2), ", ",
+                     format(round(HR_high, 2), nsmall = 2), ")")
+  )
+
+# tabular results interaction
+tabreste_inter <- left_join(tesum_inter, tabres_inter, 
+                            by = c("type_sensitivity", "signature", "sign_bin", "therapy_class")) %>%
+  group_by(type_sensitivity, signature, sign_bin) %>% 
+  mutate(
+    n_0 = n[therapy_class == "ARSi" & comparison == "Taxane"],
+    e_0 = progr[therapy_class == "ARSi" & comparison == "Taxane"],
+    n_1 = n[therapy_class == "ARSi" & comparison == "Taxane"],
+    e_1 = progr[therapy_class == "ARSi" & comparison == "Taxane"],
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend),
+    comparison = factor(comparison, levels = names(therapies_legend), labels = therapies_legend),
+    within_signature = factor(sign_bin, levels = c(0, 1), labels = c("Signature negative", "Signature positive")),
+    n_text = format(n, nsmall = 0),
+    prog_text = format(progr, nsmall = 0),
+    prob_sup = format(round(prob_sup, 2), nsmall = 2),
+    STR_text = paste0(format(round(STR_median, 2), nsmall = 2), " (", 
+                      format(round(STR_low, 2), nsmall = 2), ", ",
+                      format(round(STR_high, 2), nsmall = 2), ")"),
+    HR_text = paste0(format(round(HR_median, 2), nsmall = 2), " (", 
+                     format(round(HR_low, 2), nsmall = 2), ", ",
+                     format(round(HR_high, 2), nsmall = 2), ")")
+  )
+
+STR_ratio_tab <- filter(coef_inter, type_sensitivity == "main") %>% 
+  mutate(signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend)) %>% 
+  group_by(signature) %>% 
+  summarise("STR ratio" = paste0(format(round(quantile(exp(b3), .5), 2), nsmall = 2), " (", 
+                                 format(round(quantile(exp(b3), .1), 2), nsmall = 2), ", ",
+                                 format(round(quantile(exp(b3), .9), 2), nsmall = 2), ")"), .groups = "drop")
+
+# medianPFS_inter_tab <- filter(medianPFS_inter, type_sensitivity == "main") %>% 
+#   mutate(
+#     therapy_class = factor(therapy_class, levels = names(therapies_legend[-1]), labels = therapies_legend[-1]),
+#     signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+#     within_signature = factor(sign_bin, levels = c(0, 1), labels = c("Signature negative", "Signature positive"))
+#   ) %>% 
+#   group_by(signature, within_signature, therapy_class) %>% 
+#   summarise("Median time" = paste0(format(round(quantile(value, .5), 1), nsmall = 1), " (", 
+#                                    format(round(quantile(value, .1), 1), nsmall = 1), ", ",
+#                                    format(round(quantile(value, .9), 1), nsmall = 1), ")"), .groups = "drop") %>% 
+#   pivot_wider(id_cols = signature, values_from = "Median time", names_prefix = "Median time_",
+#               names_from = c(within_signature, therapy_class))
+
+n_inter_tab <- filter(tabres_inter, type_sensitivity == "main") %>% 
+  mutate("Events/N" = paste0(progr, "/", n)) %>% 
+  select(therapy_class, signature, sign_bin, `Events/N`) %>% 
+  arrange(signature, sign_bin, therapy_class) %>% 
+  mutate(
+    therapy_class = factor(therapy_class, levels = names(therapies_legend[-1]), labels = therapies_legend[-1]),
+    signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+    within_signature = factor(sign_bin, levels = c(0, 1), labels = c("Signature negative", "Signature positive"))
+  ) %>% 
+  pivot_wider(id_cols = signature, values_from = "Events/N", names_prefix = "Events/N_",
+              names_from = c(within_signature, therapy_class))
+
+
+# tabular results by subgroup
+tabreste_subgroup <- full_join(tesum_subgroup, tabres_subgroup, 
+                               by = c("subgroup", "therapy_class")) %>% 
+  mutate(
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend),
+    comparison = factor(comparison, levels = names(therapies_legend), labels = therapies_legend),
+    n_text = format(n, nsmall = 0),
+    prog_text = format(progr, nsmall = 0),
+    prob_sup = format(round(prob_sup, 2), nsmall = 2),
+    rate_text = paste0(format(round(rate, 2), nsmall = 2), " (", 
+                       format(round(`rate 5%`, 2), nsmall = 2), ", ",
+                       format(round(`rate 95%`, 2), nsmall = 2), ")"),
+    STR_text = paste0(format(round(STR_median, 2), nsmall = 2), " (", 
+                      format(round(STR_low, 2), nsmall = 2), ", ",
+                      format(round(STR_high, 2), nsmall = 2), ")"),
+    HR_text = paste0(format(round(HR_median, 2), nsmall = 2), " (", 
+                     format(round(HR_low, 2), nsmall = 2), ", ",
+                     format(round(HR_high, 2), nsmall = 2), ")")
+  )
+
+
+# tabular results overall survival
+tabres_os_cmp <- lapply(type_sensitivity_os, function(sens) { 
+  lapply(signatures_cr, function(s) {
+    lapply(strsplit(names(cmp_legend), split = "-"), function(cmp) {
+      filter(tabres_os, type_sensitivity == sens, signature == s, therapy_class %in% cmp) %>% 
+        mutate(
+          n_0 = n[therapy_class == cmp[2]],
+          e_0 = deaths[therapy_class == cmp[2]],
+          n_1 = n[therapy_class == cmp[1]],
+          e_1 = deaths[therapy_class == cmp[1]],
+          comparison = cmp[2]
+        ) %>% 
+        select(type_sensitivity, signature, therapy_class, comparison, n_0, e_0, n_1, e_1) %>% 
+        filter(therapy_class == cmp[1])
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+}) %>% bind_rows()
+
+tabreste_os <- full_join(tesum_os, tabres_os_cmp, 
+                         by = c("type_sensitivity", "signature", "therapy_class", "comparison")) %>% 
+  mutate(
+    signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend),
+    comparison = factor(comparison, levels = names(therapies_legend), labels = therapies_legend),
+    across(starts_with(c("n_", "e_")), \(x) format(x, nsmall = 0), .names = "{.col}_text"),
+    prob_sup_text = format(round(prob_sup, 2), nsmall = 2),
+    STR_text = paste0(format(round(STR_median, 2), nsmall = 2), " (", 
+                      format(round(STR_low, 2), nsmall = 2), ", ",
+                      format(round(STR_high, 2), nsmall = 2), ")"),
+    HR_text = paste0(format(round(HR_median, 2), nsmall = 2), " (", 
+                     format(round(HR_low, 2), nsmall = 2), ", ",
+                     format(round(HR_high, 2), nsmall = 2), ")")
+  )
+
+
+
+# main figures and tables ----
+
+
+## text ----
+
+# km_primary$main$all
+# km_os$main$all
+
+
+## figure 1 ----
+
+# manual drawing (see output/)
+info_flowchart
+add_info_flowchart
+
+
+## table 1 ----
+
+lab_table1_cr_short <- lab_table1_cr[setdiff(names(lab_table1_cr), c("E1_F7_Hb", "E1_F7_LDH", "E1_F7_ALP"))]
+lab_table1_cr_short[paste0(names(signatures_legend[-1]), "_entry")] <- signatures_legend[-1]
+table1_list <- lapply(type_sensitivity, function(sens) {
+  dat_s <- dat_baseline %>% 
+    filter(id %in% id_sensitivity[[sens]]) %>% 
+    select(therapy_class, rand_round, all_of(names(lab_table1_cr_short))) %>% 
+    mutate(therapy_class = factor(therapy_class, levels = names(therapies_legend),
+                                  labels = therapies_legend),
+           across(c(E1_F29_trt_line, type_systemic_before_mcrp, received_ARSi, 
+                    received_taxane), droplevels)) %>% 
+    set_variable_labels(.labels = as.list(lab_table1_cr_short), .strict = FALSE)
+  if (sens %in% c("main", "norechal")) {
+    tbl_strata(
+      data = dat_s, strata = rand_round,
+      .tbl_fun =
+        ~ .x %>% tbl_summary(by = therapy_class, missing = "no") %>% 
+        modify_footnote(update = everything() ~ NA) %>% 
+        modify_header(label ~ "Characteristic") %>% 
+        modify_header(all_stat_cols() ~ "{level} \n(N = {n})"),
+      .header = "Randomization round: {strata} \n(N = {n})"
+    )
+  } else {
+    tbl_summary(dat_s, by = therapy_class, missing = "no") %>% 
+      modify_header(label ~ "Characteristic") %>% 
+      modify_footnote(update = everything() ~ NA) %>% 
+      modify_header(update = all_stat_cols() ~ "{level}, N = {n}")
+  }
+})
+# table1_list$main
+
+if (save_output) {
+  flextable::save_as_docx(as_flex_table(table1_list$main) %>% 
+                            colformat_md(), path = "analyses/ARSi-all/output/NM/tab1_baseline_char.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 15, height = 10)
+                          ))
+}
+
+
+## figure 2 ----
+
+fig2 <- combine_ggsurv(
+  ggsurv_list = list(postsurv_primary$main$all + labs(y = paste0(outcome_lab, " (%)"), 
+                                                      title = paste0("A) ", outcome_lab)),
+                     postsurv_os$main$all + labs(title = "B) Overall survival")),
+  ncol = 2, nrow = 1)
+fig2
+
+if (save_output) {
+  ggsave(filename = "analyses/ARSi-all/output/NM/fig2_postsurv.pdf", plot = fig2, 
+         width = 14, height = 8)
+}
+
+
+## table 2 ----
+
+tab2 <- full_join(
+  tabreste_main %>% 
+    filter(type_sensitivity == "main") %>% 
+    mutate(
+      Arm = paste0(therapy_class, " (", e_1, "/", n_1, ")"),
+      Referent = paste0(comparison, " (", e_0, "/", n_0, ")")
+    ) %>% 
+    select(signature, therapy_class, comparison, "Arm (Events/N)" = Arm, "Referent (Events/N)" = Referent, 
+           "Probability of \nsuperiority" = prob_sup_text, "STR (90% CrI)" = STR_text) %>% 
+    rename_with(~ paste0(outcome_lab, "_", .x), c(-signature, -therapy_class, -comparison)),
+  tabreste_os %>% 
+    filter(type_sensitivity == "main") %>% 
+    mutate(
+      Arm = paste0(therapy_class, " (", e_1, "/", n_1, ")"),
+      Referent = paste0(comparison, " (", e_0, "/", n_0, ")")
+    ) %>% 
+    select(signature, therapy_class, comparison, "Arm (Events/N)" = Arm, "Referent (Events/N)" = Referent, 
+           "Probability of \nsuperiority" = prob_sup_text, "STR (90% CrI)" = STR_text) %>% 
+    rename_with(~ paste0("Overall survival_", .x), c(-signature, -therapy_class, -comparison)),
+  by = c("signature", "therapy_class", "comparison")
+) %>% 
+  select(Analysis = signature, everything(), -therapy_class, -comparison) %>% 
+  as_grouped_data(groups = "Analysis") %>% 
+  as_flextable() %>% 
+  align(i = ~ !is.na(Analysis), align = "center") %>% 
+  # bold(i = ~ !is.na(Analysis)) %>% 
+  colformat_md(j = where(~ is.factor(.x) | is.character(.x))) %>% 
+  #align(i = ~ !is.na(Analysis), align = "center") %>% 
+  #set_header_labels(Analysis = "") %>% 
+  flextable::separate_header() %>% 
+  autofit()
+# gt(groupname_col = "signature") %>% 
+# tab_spanner_delim(delim = "_", split = c("last", "first"))
+
+if (save_output) {
+  flextable::save_as_docx(tab2, path = "analyses/ARSi-all/output/NM/tab2_str.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 15, height = 10)
+                          ))
+}
+
+
+
+## table 3 ----
+
+tab3 <- left_join(n_inter_tab, 
+                  filter(tabreste_inter, type_sensitivity == "main") %>% 
+                    mutate(within_signature = paste(within_signature, "_ ")) %>% 
+                    select(signature, within_signature, STR = STR_text) %>% 
+                    pivot_wider(id_cols = signature, names_from = within_signature, 
+                                values_from = STR, names_prefix = "Survival Time Ratio (STR)_"),
+                  by = "signature") %>% 
+  left_join(rename(STR_ratio_tab, "STR ratio_ _ " = "STR ratio"), by = "signature") %>% 
+  rename(Signature = signature) %>% 
+  flextable() %>%
+  colformat_md(j = where(is.factor)) %>% 
+  flextable::separate_header() %>% 
+  autofit()
+tab3
+
+if (save_output) {
+  flextable::save_as_docx(tab3, path = "analyses/ARSi-all/output/NM/tab3_interaction.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 13, height = 10)
+                          ))
+}
+
+
+
+
+
+# supplementary figures and tables ----
+
+
+## suppfig_str_signature ----
+
+pfig_str_signature <- bind_rows(
+  filter(te_main, type_sensitivity == "main") %>% mutate(outcome = paste0("A) ", outcome_lab)),
+  filter(te_os, type_sensitivity == "main") %>% mutate(outcome = "B) Overall survival")
+) %>% 
+  mutate(
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend),
+    comparison = factor(comparison, levels = names(therapies_legend), labels = therapies_legend),
+    signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+    group = paste0(therapy_class, " vs ", comparison),
+    group = factor(group, levels = c("Taxanes vs Physician's choice", "AR Pathway Inhibitors vs Taxanes", 
+                                     "AR Pathway Inhibitors vs Physician's choice"))
+  ) %>% 
+  ggplot(aes(x = logSTR, y = signature, col = group, fill = group)) +
+  stat_slab(alpha = .3, adjust = 1.5) +
+  stat_pointinterval(.width = c(.75, .9), 
+                     position = position_dodge(width = .5, preserve = "single")) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_grid(~ outcome, scales = "free") + 
+  scale_x_continuous(breaks = log(c(1/4, 1/2, 1, 2, 4)), labels = c(1/4, 1/2, 1, 2, 4),
+                     limits = log(c(.4, 5))) +
+  scale_y_discrete(limits = rev) + 
+  scale_fill_discrete(type = coltherapies_cmp, breaks = c("AR Pathway Inhibitors vs Physician's choice", 
+                                                          "AR Pathway Inhibitors vs Taxanes", "Taxanes vs Physician's choice")) +
+  scale_color_discrete(type = coltherapies_cmp, breaks = c("AR Pathway Inhibitors vs Physician's choice", 
+                                                           "AR Pathway Inhibitors vs Taxanes", "Taxanes vs Physician's choice")) +
+  labs(x = "Survival time ratio", y = "", fill = "Comparison", col = "Comparison") + 
+  guides(fill = guide_legend(nrow = 3)) +
+  theme(legend.justification = "center",
+        axis.text.y = element_markdown()) #legend.direction = "vertical"
+pfig_str_signature
+
+if (save_output) {
+  ggsave(filename = "analyses/ARSi-all/output/NM/suppfig_str_signature.pdf", 
+         plot = pfig_str_signature, width = 10, height = 8)
+}
+
+
+
+## suppltab_tab2sensitivity ----
+
+sensitivity_legend <- c("main" = "Main analysis", "1line" = "First line", 
+                        "adtmono" = "First line post ADT only", "norechal" = "No re-challenge")
+sensitivity_legend_os <- c("main" = "Main analysis", "1line" = "First line", 
+                           "adtmono" = "First line post ADT only", "norechal" = "No re-challenge")
+
+# OBS: format feasible only if NLCB and OS have the same sensitivity analyses
+tab2_suppl <- full_join(
+  tabreste_main %>% 
+    #filter(type_sensitivity != "adtmono") %>% 
+    mutate(
+      Arm = paste0(therapy_class, " (", e_1, "/", n_1, ")"),
+      Referent = paste0(comparison, " (", e_0, "/", n_0, ")")
+    ) %>% 
+    select(signature, therapy_class, comparison, "Arm (Events/N)" = Arm, 
+           "Referent (Events/N)" = Referent, type_sensitivity, 
+           "Probability of \nsuperiority" = prob_sup_text, "STR (90% CrI)" = STR_text) %>% 
+    rename_with(~ paste0(outcome_lab, "_", .x), 
+                c(-signature, -therapy_class, -comparison, -type_sensitivity)),
+  tabreste_os %>% 
+    #filter(type_sensitivity != "adtmono") %>% 
+    mutate(
+      Arm = paste0(therapy_class, " (", e_1, "/", n_1, ")"),
+      Referent = paste0(comparison, " (", e_0, "/", n_0, ")")
+    ) %>% 
+    select(signature, therapy_class, comparison, "Arm (Events/N)" = Arm, 
+           "Referent (Events/N)" = Referent, type_sensitivity,
+           "Probability of \nsuperiority" = prob_sup_text, "STR (90% CrI)" = STR_text) %>% 
+    rename_with(~ paste0("Overall survival_", .x), 
+                c(-signature, -therapy_class, -comparison, -type_sensitivity)),
+  by = c("signature", "therapy_class", "comparison", "type_sensitivity")
+) %>% 
+  mutate(type_sensitivity = factor(type_sensitivity, levels = names(sensitivity_legend)[1:4],
+                                   labels = sensitivity_legend[1:4])) %>% 
+  arrange(signature, therapy_class, comparison, type_sensitivity) %>% 
+  select(Analysis = signature, Subgroup = type_sensitivity, everything(), -therapy_class, -comparison) %>% 
+  as_grouped_data(groups = "Analysis") %>% 
+  as_flextable() %>% 
+  align(i = ~ !is.na(Analysis), align = "center") %>% 
+  colformat_md(j = where(~ is.factor(.x) | is.character(.x))) %>% 
+  flextable::separate_header() %>% 
+  autofit()
+# tab2_suppl
+
+if (save_output) {
+  flextable::save_as_docx(tab2_suppl, path = "analyses/ARSi-all/output/NM/suppltab_tab2sensitivity.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 17, height = 10)
+                          ))
+}
+
+
+## suppfig_fig2sensitivity ----
+
+fig2suppl <- combine_ggsurv(
+  ggsurv_list2 = lapply(signatures_cr[-1], function(s) 
+    list(postsurv_primary$main[[s]] +
+           labs(y = paste0(outcome_lab, " (%)")), 
+         postsurv_os$main[[s]])
+  ), title2 = signatures_legend, ncol = 1, nrow = 4)
+fig2suppl
+
+if (save_output) {
+  ggsave(filename = "analyses/ARSi-all/output/NM/suppfig_fig2sensitivity.pdf", plot = fig2suppl, 
+         width = 14, height = 7*4)
+}
+
+
+
+## suppfig_str_interaction ----
+
+pte_inter <- filter(te_inter, type_sensitivity == "main", comparison == "Taxane") %>% 
+  mutate(
+    signature = factor(signature, levels = names(signatures_legend[-1]), labels = signatures_legend[-1]),
+    within_signature = factor(sign_bin, levels = c(0, 1), labels = c("Signature negative", "Signature positive"))
+  ) %>% 
+  ggplot(aes(logSTR, y = signature, col = within_signature, fill = within_signature)) +
+  stat_slab(alpha = .3, adjust = 1.5) +
+  stat_pointinterval(.width = c(.75, .90), 
+                     position = position_dodge(width = .2, preserve = "single")) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = col_withinsign) +
+  scale_color_manual(values = col_withinsign) +
+  scale_x_continuous(breaks = log(c(1 / 5, 1 / 2, 1, 2, 5)), 
+                     labels = c(1 / 5, 1 / 2, 1, 2, 5), limits = log(c(.5, 5))) +
+  labs(x = "Survival Time Ratio", col = "", fill = "", y = "") +
+  scale_y_discrete(limits = rev) +
+  theme(legend.text = element_markdown(),
+        axis.text.y = element_markdown())
+
+if (save_output) {
+  ggsave(filename = "analyses/ARSi-all/output/NM/suppfig_str_interaction.pdf", plot = pte_inter, 
+         width = 6, height = 7)
+}
+
+
+## suppfig_postsurv_interaction ----
+
+p_postsurv_interaction <- combine_ggsurv(
+  ggsurv_list2 = lapply(signatures_cr[-1], function(s) 
+    lapply(names(postsurv_interaction$main[[s]]), function(f)
+      postsurv_interaction$main[[s]][[f]] + labs(y = paste0(outcome_lab, " (%)"),
+                                                 title = ifelse(as.integer(f) == 1, signatures_legend[s], signatures_legend_complement[s])))
+  ), title2 = NULL, ncol = 1, nrow = 4)
+
+if (save_output) {
+  ggsave(filename = "analyses/ARSi-all/output/NM/suppfig_postsurv_interaction.pdf", 
+         plot = p_postsurv_interaction, width = 14, height = 7*4, device = cairo_pdf)
+}
+
+
+
+## suppfig_change_randprob ----
+
+prandprob_signtherapy_cr <- dat_randprob_signtherapy_cr %>% 
+  mutate(
+    signature = factor(signature, levels = names(signatures_legend), labels = signatures_legend),
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend)
+  ) %>% 
+  ggplot(aes(date, rand_prob_prev, col = therapy_class)) +
+  geom_step() +
+  facet_wrap(~ signature, scales = "free_y") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "6 months", minor_breaks = NULL) +
+  scale_y_continuous(labels = percent) +
+  scale_color_manual(values = set_names(coltherapies, therapies_legend)) +
+  labs(x = "", y = "Randomization probability", col = "Group") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom",
+        legend.text = element_text(size = 8), strip.text.x = element_markdown())
+prandprob_signtherapy_cr
+
+if (save_output) {
+  ggsave(filename = "analyses/ARSi-all/output/NM/suppfig_change_randprob.pdf", 
+         plot = prandprob_signtherapy_cr, width = 9, height = 6)
+}
+
+
+## supptable_sae ----
+
+lab_table1_sae <- set_names(selected_sysorgclass, nm = selected_sysorgclass) %>% 
+  c("Any serious adverse event" = "any_sae", "Number of serious adverse events" = "n_sae_cat", .)
+
+table1_sae <- arsiall_sae %>% 
+  select(therapy_group, any_of(lab_table1_sae)) %>% 
+  tbl_summary(by = "therapy_group") %>% 
+  modify_header(label ~ "Characteristic") %>% 
+  modify_footnote(update = everything() ~ NA) %>% 
+  modify_header(update = all_stat_cols() ~ "{level}, N = {n}")
+# table1_sae
+
+if (save_output) {
+  flextable::save_as_docx(as_flex_table(table1_sae), path = "analyses/ARSi-all/output/NM/supptable_sae.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 15, height = 10)
+                          ))
+}
+
+
+## supptable_typeprog ----
+
+lab_typeprog_cr <- c(
+  "psa_prog" = "PSA progression",
+  "radio_prog" = "Radiological progression",
+  "clinic_prog" = "Clinical progression",
+  "num_dim_prog" = "Number of dimensions for progression",
+  "type_prog_driven" = "Type of progression driven by"
+)
+
+table_typeprog <- arsi_all %>% 
+  mutate(therapy_class = factor(therapy_class, levels = names(therapies_legend),
+                                labels = therapies_legend)) %>% 
+  select(therapy_class, all_of(names(lab_typeprog_cr))) %>% 
+  set_variable_labels(.labels = as.list(lab_typeprog_cr), .strict = FALSE) %>% 
+  tbl_summary(by = therapy_class, missing = "no") %>% 
+  modify_header(label ~ "Characteristic") %>% 
+  modify_footnote(update = everything() ~ NA) %>% 
+  modify_header(update = all_stat_cols() ~ "{level}, N = {n}")
+table_typeprog
+
+
+if (save_output) {
+  flextable::save_as_docx(as_flex_table(table_typeprog), path = "analyses/ARSi-all/output/NM/supptable_typeprog.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 15, height = 10)
+                          ))
+}
+
+
+
+## supptable trt_received_tab ----
+
+trt_received_tab <- select(arsi_all, therapy_class, `Treatment received` = trt_received) %>% 
+  mutate(
+    therapy_class = factor(therapy_class, levels = names(therapies_legend), labels = therapies_legend),
+    `Treatment received` = droplevels(`Treatment received`)
+  ) %>% 
+  tbl_summary(by = therapy_class) %>%
+  modify_header(label ~ "Characteristic") %>% 
+  modify_footnote(update = everything() ~ NA) %>% 
+  modify_header(update = all_stat_cols() ~ "{level}, N = {n}")
+trt_received_tab
+
+if (save_output) {
+  flextable::save_as_docx(as_flex_table(trt_received_tab), path = "analyses/ARSi-all/output/NM/supptable_trtreceived.docx",
+                          pr_section = prop_section(
+                            page_size = page_size(orient = "landscape",
+                                                  width = 10, height = 6)
+                          ))
+}
